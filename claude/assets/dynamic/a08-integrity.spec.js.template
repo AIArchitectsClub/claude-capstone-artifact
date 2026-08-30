@@ -1,0 +1,41 @@
+// OWASP A08:2021 — Software & Data Integrity Failures.
+// ADAPT: lockfile name if not npm.
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { test, expect } from "../fixtures.js";
+
+const APP_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+test.describe("A08 integrity", () => {
+  test("a dependency lockfile is present", async () => {
+    const has = ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock"].some((f) =>
+      fs.existsSync(path.join(APP_ROOT, f)),
+    );
+    expect(has, "no lockfile — builds are not reproducible").toBe(true);
+  });
+
+  test("the built page loads only same-origin assets, or cross-origin ones with SRI", async ({ request }) => {
+    const html = await (await request.get("/")).text();
+    const tags = [...html.matchAll(/<(script|link)\b[^>]*>/gi)].map((m) => m[0]);
+    for (const tag of tags) {
+      const url = (tag.match(/(?:src|href)="([^"]+)"/) || [])[1];
+      if (!url) continue;
+      const isCrossOrigin = /^https?:\/\//i.test(url) && !url.includes("localhost");
+      if (isCrossOrigin) {
+        expect(tag, `cross-origin ${url} has no integrity=`).toMatch(/integrity="/);
+      }
+    }
+  });
+
+  test("no sourcemaps are shipped in the build", async ({ baseURL, request }) => {
+    const html = await (await request.get("/")).text();
+    for (const m of html.matchAll(/(?:src|href)="(\/assets\/[^"]+)"/g)) {
+      const asset = await (await request.get(m[1])).text();
+      expect(asset, `${m[1]} contains a sourceMappingURL`).not.toMatch(/\/\/#\s*sourceMappingURL=/);
+      const map = await request.get(m[1] + ".map");
+      expect([403, 404]).toContain(map.status());
+    }
+  });
+});

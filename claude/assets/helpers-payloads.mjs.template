@@ -1,0 +1,68 @@
+// Attack payload corpora shared by the dynamic specs.
+
+export const SQLI = [
+  "' OR '1'='1",
+  "' OR 1=1--",
+  "'; DROP TABLE flights;--",
+  "\" OR \"\"=\"",
+  "1' UNION SELECT null,null,null--",
+  "' OR SLEEP(3)--",
+  "admin'--",
+  "') OR ('1'='1",
+  "1;SELECT pg_sleep(3)--",
+  "%27%20OR%201=1--",
+];
+
+export const XSS = [
+  "<script>window.__xss=1</script>",
+  "<img src=x onerror=\"window.__xss=1\">",
+  "\"><svg/onload=window.__xss=1>",
+  "javascript:window.__xss=1",
+  "<iframe src=javascript:window.__xss=1>",
+];
+
+export const TRAVERSAL = [
+  "../../../../etc/passwd",
+  "..%2f..%2f..%2fetc%2fpasswd",
+  "....//....//etc/passwd",
+  "/etc/passwd",
+  "..\\..\\..\\windows\\win.ini",
+];
+
+export const CRLF = [
+  "x%0d%0aSet-Cookie:%20injected=1",
+  "x\r\nSet-Cookie: injected=1",
+  "x%0aX-Injected:%20true",
+];
+
+export const SSRF = [
+  "http://169.254.169.254/latest/meta-data/",
+  "http://localhost:22",
+  "http://127.0.0.1:3998/api/bookings",
+  "file:///etc/passwd",
+  "http://[::1]:80/",
+];
+
+// DB error signatures that must never reach an HTTP response body.
+export const DB_ERROR_SIGNATURES = [
+  /syntax error at or near/i,
+  /unterminated quoted string/i,
+  /column .* does not exist/i,
+  /relation .* does not exist/i,
+  /invalid input syntax/i,
+  /\bpg_/i,
+  /\bpsql\b/i,
+  /QueryFailedError/i,
+  /SequelizeDatabaseError/i,
+  /ER_PARSE_ERROR/i,
+];
+
+// Stack-trace / internals signatures that must never reach an HTTP response body.
+export const LEAK_SIGNATURES = [
+  /\bat Object\.<anonymous>/,
+  /\bat process\.processTicksAndRejections/,
+  /\/node_modules\//,
+  /\bError:\s.+\n\s+at\s/,
+  /[A-Za-z]:\\[^\s]+\\/, // windows path
+  /\/(Users|home|var|opt)\/[^\s"']+\.js/, // posix source path
+];

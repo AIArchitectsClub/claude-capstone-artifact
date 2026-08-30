@@ -1,0 +1,79 @@
+// OWASP A03:2021 — Injection (SQL, XSS, CRLF/header).
+// ADAPT: the injectable params, the resource id route, the field rendered in the UI.
+
+import { test, expect } from "../fixtures.js";
+import { hit } from "../helpers/raw.mjs";
+import { SQLI, XSS, CRLF, DB_ERROR_SIGNATURES } from "../helpers/payloads.mjs";
+import { count, tableNames, closePool } from "../helpers/db.mjs";
+
+test.afterAll(() => closePool());
+
+test.describe("A03 injection", () => {
+  test("SQL injection payloads do not error, leak, or mutate data", async ({ userA, baseURL }) => {
+    const before = await count("flights");
+    const tablesBefore = (await tableNames()).sort();
+
+    for (const p of SQLI) {
+      const reqs = [
+        hit(baseURL, "GET", `/api/flights?origin=${encodeURIComponent(p)}`),
+        hit(baseURL, "GET", `/api/flights?destination=${encodeURIComponent(p)}`),
+        hit(baseURL, "GET", `/api/flights?date=${encodeURIComponent(p)}`),
+        hit(baseURL, "GET", `/api/flights/${encodeURIComponent(p)}`),
+        hit(baseURL, "POST", "/api/bookings", { cookie: userA.cookieHeader, body: { flightId: p, quantity: 1 } }),
+      ];
+      for (const r of await Promise.all(reqs)) {
+        expect(r.status, `payload ${p} -> 500`).not.toBe(500);
+        for (const sig of DB_ERROR_SIGNATURES) {
+          expect(r.text || "", `payload ${p} leaks a DB error`).not.toMatch(sig);
+        }
+      }
+    }
+
+    expect(await count("flights"), "row count changed after SQLi").toBe(before);
+    expect((await tableNames()).sort(), "table set changed after SQLi").toEqual(tablesBefore);
+  });
+
+  test("SQL injection in the login field does not authenticate", async ({ anon }) => {
+    for (const p of ["' OR '1'='1", "admin'--", "' OR 1=1--"]) {
+      const r = await anon.post("/api/auth/sign-in/email", { data: { email: p, password: p } });
+      expect(r.status(), `login bypass with ${p}`).toBeGreaterThanOrEqual(400);
+      const setCookie = r.headersArray().some((h) => h.name.toLowerCase() === "set-cookie" && /session|token/i.test(h.value));
+      expect(setCookie, `login with ${p} set a session cookie`).toBe(false);
+    }
+  });
+
+  test("stored value with an XSS payload is returned inert and never as HTML", async ({ userA, browser, baseURL, seeded }) => {
+    const payload = '<img src=x onerror="window.__xss_fired=true">';
+    const create = await userA.ctx.post("/api/bookings", {
+      data: { flightId: "fl_sec_roomy", quantity: 1, passengerNames: payload },
+    });
+    expect(create.status()).toBe(201);
+
+    // API contract: JSON, payload stored verbatim, not reflected as text/html
+    const list = await userA.ctx.get("/api/bookings");
+    expect(list.headers()["content-type"]).toContain("application/json");
+    expect(JSON.stringify(await list.json())).toContain("onerror");
+
+    // Browser: render /bookings as user A and confirm the payload does not execute
+    const ctx = await browser.newContext({ baseURL });
+    const name = (userA.cookieHeader || "").split("=")[0];
+    const value = (userA.cookieHeader || "").split("=").slice(1).join("=");
+    await ctx.addCookies([{ name, value, domain: new URL(baseURL).hostname, path: "/" }]);
+    const page = await ctx.newPage();
+    let dialogFired = false;
+    page.on("dialog", (d) => { dialogFired = true; d.dismiss(); });
+    await page.goto("/bookings");
+    await page.waitForTimeout(1500);
+    expect(await page.evaluate(() => window.__xss_fired === true)).toBe(false);
+    expect(dialogFired).toBe(false);
+    await ctx.close();
+  });
+
+  test("CRLF payloads do not inject response headers", async ({ baseURL }) => {
+    for (const p of CRLF) {
+      const r = await hit(baseURL, "GET", `/api/flights?origin=${p}`);
+      expect(r.headers["set-cookie"] || "").not.toContain("injected=1");
+      expect(r.headers["x-injected"]).toBeUndefined();
+    }
+  });
+});

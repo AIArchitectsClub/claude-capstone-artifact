@@ -1,0 +1,34 @@
+// OWASP A05:2021 — Security Misconfiguration: response security headers.
+// ADAPT: nothing usually — this is a portable baseline. Loosen only with a written reason.
+
+import { test, expect } from "../fixtures.js";
+import { hit } from "../helpers/raw.mjs";
+
+test.describe("A05 security headers", () => {
+  test("the app does not advertise its framework", async ({ baseURL }) => {
+    const r = await hit(baseURL, "GET", "/");
+    expect(r.headers["x-powered-by"]).toBeUndefined();
+  });
+
+  test("baseline security headers are present on HTML and API responses", async ({ baseURL, userA }) => {
+    for (const [path, cookie] of [["/", null], ["/api/flights", null], ["/api/bookings", userA.cookieHeader]]) {
+      const r = await hit(baseURL, "GET", path, { cookie });
+      expect(r.headers["x-content-type-options"], path).toBe("nosniff");
+      expect(String(r.headers["x-frame-options"] || "").toUpperCase(), path).toMatch(/^(DENY|SAMEORIGIN)$/);
+      expect(r.headers["referrer-policy"], path).toBeTruthy();
+      expect(r.headers["strict-transport-security"], path).toMatch(/max-age=\d+/);
+    }
+  });
+
+  test("a Content-Security-Policy is set and is not trivially bypassable", async ({ baseURL }) => {
+    const r = await hit(baseURL, "GET", "/");
+    const csp = r.headers["content-security-policy"];
+    expect(csp, "no CSP on the HTML document").toBeTruthy();
+    expect(csp).toMatch(/default-src[^;]*'self'/);
+    expect(csp).toMatch(/object-src[^;]*'none'/);
+    expect(csp).toMatch(/frame-ancestors[^;]*'none'/);
+    const scriptSrc = (csp.match(/script-src([^;]*)/) || [])[1] || csp.match(/default-src([^;]*)/)[1];
+    expect(scriptSrc, "script-src allows 'unsafe-inline'").not.toContain("'unsafe-inline'");
+    expect(scriptSrc, "script-src allows 'unsafe-eval'").not.toContain("'unsafe-eval'");
+  });
+});
