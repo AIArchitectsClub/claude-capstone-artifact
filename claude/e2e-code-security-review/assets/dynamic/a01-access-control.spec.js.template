@@ -1,0 +1,95 @@
+// OWASP A01:2021 — Broken Access Control.
+// ADAPT: protected endpoints, the resource id field, mass-assignment field names.
+
+import { test, expect } from "../fixtures.js";
+import { hit } from "../helpers/raw.mjs";
+
+const ROOMY = "fl_sec_roomy";
+
+test.describe("A01 broken access control", () => {
+  test("protected endpoints reject unauthenticated requests with 401", async ({ baseURL }) => {
+    for (const [method, path, body] of [
+      ["GET", "/api/bookings"],
+      ["POST", "/api/bookings", { flightId: ROOMY, quantity: 1 }],
+      ["DELETE", "/api/bookings/bk_whatever"],
+    ]) {
+      const r = await hit(baseURL, method, path, { body });
+      expect(r.status, `${method} ${path}`).toBe(401);
+      expect(r.status, `${method} ${path} must not be a silent 200`).not.toBe(200);
+    }
+  });
+
+  test("a user cannot read or delete another user's booking (IDOR)", async ({ userA, userB }) => {
+    const created = await userA.ctx.post("/api/bookings", { data: { flightId: ROOMY, quantity: 1 } });
+    expect(created.status()).toBe(201);
+    const bookingId = (await created.json()).id;
+
+    const listB = await (await userB.ctx.get("/api/bookings")).json();
+    expect(Array.isArray(listB) ? listB : []).toEqual([]);
+    expect(JSON.stringify(listB)).not.toContain(bookingId);
+
+    const delB = await userB.ctx.delete(`/api/bookings/${bookingId}`);
+    expect([403, 404]).toContain(delB.status());
+
+    const listA = await (await userA.ctx.get("/api/bookings")).json();
+    expect(listA.find((b) => b.id === bookingId)?.status).toBe("confirmed");
+  });
+
+  test("mass assignment — privileged fields in the body are ignored", async ({ userA, userB, baseURL }) => {
+    const res = await hit(baseURL, "POST", "/api/bookings", {
+      cookie: userA.cookieHeader,
+      body: {
+        flightId: ROOMY,
+        quantity: 1,
+        user_id: userB.id,
+        userId: userB.id,
+        id: "bk_attacker_chosen",
+        status: "comped",
+        total_price: 0.01,
+        totalPrice: 0.01,
+        created_at: "1999-01-01T00:00:00Z",
+      },
+    });
+    expect(res.status).toBe(201);
+    const b = res.json;
+    expect(b.id).not.toBe("bk_attacker_chosen");
+    expect(b.status).toBe("confirmed");
+    expect(b.totalPrice).toBe(200); // server-computed (1 x seed price), not 0.01
+
+    // the booking belongs to A, not the injected userB
+    const listB = await (await userB.ctx.get("/api/bookings")).json();
+    expect(JSON.stringify(listB)).not.toContain(b.id);
+    const listA = await (await userA.ctx.get("/api/bookings")).json();
+    expect(listA.some((x) => x.id === b.id)).toBe(true);
+  });
+
+  test("unsupported methods on a resource are not silently accepted", async ({ userA, baseURL }) => {
+    const created = await userA.ctx.post("/api/bookings", { data: { flightId: ROOMY, quantity: 1 } });
+    const id = (await created.json()).id;
+    for (const method of ["PUT", "PATCH"]) {
+      const r = await hit(baseURL, method, `/api/bookings/${id}`, { cookie: userA.cookieHeader, body: { status: "x" } });
+      expect([404, 405, 501], `${method} should not succeed`).toContain(r.status);
+    }
+  });
+
+  test("session cookie is SameSite Lax or Strict (CSRF baseline)", async ({ userA }) => {
+    const cookie = userA.rawSetCookie.join(" ; ");
+    expect(cookie, "no Set-Cookie captured from sign-up").not.toEqual("");
+    expect(cookie.toLowerCase()).toMatch(/samesite=(lax|strict)/);
+    expect(cookie.toLowerCase()).not.toMatch(/samesite=none/);
+  });
+
+  test("a cookie-bearing auth mutation is rejected without a trusted Origin (CSRF guard)", async ({ userA, baseURL }) => {
+    const noOrigin = await hit(baseURL, "POST", "/api/auth/sign-out", { cookie: userA.cookieHeader });
+    expect(noOrigin.status, "sign-out accepted with no Origin header").toBe(403);
+
+    const evilOrigin = await hit(baseURL, "POST", "/api/auth/sign-out", {
+      cookie: userA.cookieHeader,
+      origin: "https://evil.example",
+    });
+    expect(evilOrigin.status, "sign-out accepted from a cross-site Origin").toBe(403);
+
+    // the real session is untouched by the rejected attempts
+    expect((await userA.ctx.get("/api/bookings")).status()).toBe(200);
+  });
+});
