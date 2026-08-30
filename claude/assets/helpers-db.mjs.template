@@ -1,0 +1,33 @@
+// Direct read-only checks against the test DB — used to prove injection payloads didn't mutate
+// or destroy data.
+
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import pg from "pg";
+import { config as loadEnv } from "dotenv";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+loadEnv({ path: path.join(__dirname, "..", ".env.security") });
+
+const URL_ = process.env.TEST_DATABASE_URL;
+const SSL = /neon\.tech|sslmode=require/.test(URL_ || "") ? { rejectUnauthorized: false } : false;
+
+let pool;
+const getPool = () => (pool ||= new pg.Pool({ connectionString: URL_, ssl: SSL, max: 2 }));
+
+export async function count(table) {
+  const { rows } = await getPool().query(`SELECT COUNT(*)::int AS n FROM ${table}`);
+  return rows[0].n;
+}
+
+export async function tableNames() {
+  const { rows } = await getPool().query(
+    `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 1`,
+  );
+  return rows.map((r) => r.table_name);
+}
+
+export async function closePool() {
+  if (pool) await pool.end();
+  pool = undefined;
+}

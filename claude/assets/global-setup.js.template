@@ -1,0 +1,115 @@
+// Playwright global setup for the dynamic security suite. Runs ONCE, in its own process.
+//
+// 1. Loads security/.env.security.
+// 2. SAFETY GUARD: refuses to run unless TEST_DATABASE_URL is set and is NOT the app's own DB
+//    (pooled and direct Neon endpoints of the same project are both rejected).
+// 3. Migrates the test DB with the app's own scripts, truncates, inserts the tiny seed.
+// 4. Builds the app (`npm run build`) so the suite tests the PRODUCTION artifact.
+// 5. Writes security/.seed-manifest.json.
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+import pg from "pg";
+import { config as loadEnv, parse as parseEnv } from "dotenv";
+import { buildSeedFlights } from "./seed-data.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const APP_ROOT = path.join(__dirname, "..");
+const MANIFEST_PATH = path.join(__dirname, ".seed-manifest.json");
+
+function dbIdentity(url) {
+  try {
+    const u = new URL(url);
+    return `${u.username}@${u.hostname.replace(/-pooler(?=\.|$)/, "")}${u.pathname}`;
+  } catch {
+    return null;
+  }
+}
+const sslFor = (url) => (/neon\.tech|sslmode=require/.test(url) ? { rejectUnauthorized: false } : false);
+
+export default async function globalSetup() {
+  loadEnv({ path: path.join(__dirname, ".env.security") });
+
+  const TEST_DB = process.env.TEST_DATABASE_URL;
+  const PORT = process.env.SECURITY_TEST_PORT || "3998";
+  const SECRET =
+    process.env.SECURITY_BETTER_AUTH_SECRET || "security_only_secret_change_me_0123456789abcdef";
+
+  if (!TEST_DB) {
+    throw new Error(
+      "[security] TEST_DATABASE_URL is not set. Copy security/.env.security.example to " +
+        "security/.env.security and point it at a SEPARATE throwaway database.",
+    );
+  }
+
+  const appEnvPath = path.join(APP_ROOT, ".env");
+  if (fs.existsSync(appEnvPath)) {
+    const appId = dbIdentity(parseEnv(fs.readFileSync(appEnvPath)).DATABASE_URL || "");
+    const testId = dbIdentity(TEST_DB);
+    if (appId && testId && appId === testId) {
+      throw new Error(
+        `[security] REFUSING TO RUN: TEST_DATABASE_URL resolves to the app's own database ` +
+          `(${testId}). This suite migrates/seeds/attacks the DB on every run. Use a separate ` +
+          `throwaway database.`,
+      );
+    }
+  }
+  console.log(`[security] test database: ${dbIdentity(TEST_DB)}`);
+
+  const childEnv = {
+    ...process.env,
+    DATABASE_URL: TEST_DB,
+    BETTER_AUTH_SECRET: SECRET,
+    BETTER_AUTH_URL: `http://localhost:${PORT}`,
+    PORT: String(PORT),
+  };
+  const run = (cmd, args, extra = {}) =>
+    execFileSync(cmd, args, { cwd: APP_ROOT, env: { ...childEnv, ...extra }, stdio: "inherit" });
+
+  console.log("[security] migrating auth schema…");
+  run("npm", ["run", "auth:migrate"]);
+  console.log("[security] migrating domain schema…");
+  run("npm", ["run", "db:migrate"]);
+
+  const pool = new pg.Pool({ connectionString: TEST_DB, ssl: sslFor(TEST_DB) });
+  try {
+    await pool.query(
+      `TRUNCATE TABLE bookings, flights, "user", "session", "account", "verification" RESTART IDENTITY CASCADE`,
+    );
+    const flights = buildSeedFlights();
+    for (const f of flights) {
+      await pool.query(
+        `INSERT INTO flights
+           (id, flight_number, airline, aircraft_type, origin, origin_city, destination,
+            destination_city, departure_at, arrival_at, capacity, price_amount, price_unit, image_url)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'per_slot','')`,
+        [
+          f.id, f.flightNumber, f.airline, f.aircraftType, f.origin, f.originCity, f.destination,
+          f.destinationCity, f.departureAt, f.arrivalAt, f.capacity, f.priceAmount,
+        ],
+      );
+    }
+    fs.writeFileSync(
+      MANIFEST_PATH,
+      JSON.stringify(
+        {
+          seededAt: new Date().toISOString(),
+          baseUrl: `http://localhost:${PORT}`,
+          authSecret: SECRET,
+          flights: flights.map((f) => ({ ...f, departureDate: f.departureAt.slice(0, 10) })),
+        },
+        null,
+        2,
+      ),
+    );
+    console.log(`[security] seeded ${flights.length} flights`);
+  } finally {
+    await pool.end();
+  }
+
+  console.log("[security] building production bundle (npm run build)…");
+  run("npm", ["run", "build"]);
+  console.log("[security] setup complete");
+}

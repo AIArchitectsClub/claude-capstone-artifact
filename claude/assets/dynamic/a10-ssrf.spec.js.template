@@ -1,0 +1,35 @@
+// OWASP A10:2021 — Server-Side Request Forgery.
+// SkyBook exposes no "fetch a user-supplied URL" surface. This spec is a guard: feed URL-shaped
+// values into every user-controlled parameter and assert the server does not treat them
+// specially (no hang from an outbound connection attempt, no change in response shape, no error
+// leak). ADAPT: if the app DOES fetch user URLs (webhooks, avatar-by-URL, link preview, PDF
+// render), replace this with real allow-list / no-internal-address assertions.
+
+import { test, expect } from "../fixtures.js";
+import { hit } from "../helpers/raw.mjs";
+import { SSRF, DB_ERROR_SIGNATURES, LEAK_SIGNATURES } from "../helpers/payloads.mjs";
+
+test.describe("A10 SSRF", () => {
+  test("URL-shaped input in request params triggers no server-side fetch", async ({ userA, baseURL }) => {
+    for (const u of SSRF) {
+      const started = Date.now();
+      const reqs = [
+        hit(baseURL, "GET", `/api/flights?origin=${encodeURIComponent(u)}`),
+        hit(baseURL, "GET", `/api/flights?destination=${encodeURIComponent(u)}`),
+        hit(baseURL, "GET", `/api/flights/${encodeURIComponent(u)}`),
+        hit(baseURL, "POST", "/api/bookings", { cookie: userA.cookieHeader, body: { flightId: u, quantity: 1, passengerNames: u } }),
+        hit(baseURL, "POST", "/api/chat", { body: { message: u } }),
+      ];
+      const results = await Promise.all(reqs);
+      expect(Date.now() - started, `slow response for ${u} — possible outbound fetch`).toBeLessThan(8000);
+      for (const r of results) {
+        expect(r.status).not.toBe(500);
+        for (const sig of [...DB_ERROR_SIGNATURES, ...LEAK_SIGNATURES]) {
+          expect(r.text || "").not.toMatch(sig);
+        }
+        // response must not contain metadata-service / file contents
+        expect(r.text || "").not.toMatch(/ami-id|instance-id|root:.*:0:0:|\[boot loader\]/i);
+      }
+    }
+  });
+});
