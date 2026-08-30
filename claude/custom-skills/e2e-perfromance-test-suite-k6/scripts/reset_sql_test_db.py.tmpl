@@ -1,0 +1,43 @@
+#!/usr/bin/env python
+"""
+Drops and lets the app recreate its schema against a LOAD-TEST database only.
+
+Adapted from the e2e-test-suite-ui-playwright skill's identical-purpose
+script (Profile A: SQLAlchemy `Base` + models living under `app.database` /
+`app.models`, matching build-fullstack-angular-python-app's output). For a
+non-SQLAlchemy backend (Profile B / Express+Postgres), don't use this script
+— run the app's own migrate/seed scripts against the test DATABASE_URL
+instead; see references/stack-detection.md.
+
+Usage:
+    python reset_sql_test_db.py <test-database-url>
+
+Safety: refuses to run unless a URL is passed explicitly on the command line
+— never reads the app's own .env, so it physically cannot default to the
+real database. Run this only after target-isolation.md's Rule 1 validation
+has already accepted the URL — never before.
+"""
+import sys
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        print("Usage: reset_sql_test_db.py <test-database-url>", file=sys.stderr)
+        raise SystemExit(2)
+
+    test_url = sys.argv[1]
+
+    # Import the app's own model metadata so drop_all/create_all matches the
+    # real schema exactly — never hand-maintain a parallel DDL script.
+    from app.database import Base  # noqa: E402
+    from app import models  # noqa: F401,E402  (imported for side effect: registers models on Base.metadata)
+    from sqlalchemy import create_engine
+
+    engine = create_engine(test_url)
+    Base.metadata.drop_all(bind=engine)
+    engine.dispose()
+    print(f"Reset schema at {test_url.split('@')[-1]} (credentials not printed).")
+
+
+if __name__ == "__main__":
+    main()

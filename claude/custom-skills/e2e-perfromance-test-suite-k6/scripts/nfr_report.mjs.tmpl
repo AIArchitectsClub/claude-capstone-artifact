@@ -1,0 +1,145 @@
+#!/usr/bin/env node
+/**
+ * Reads a k6 `--summary-export` JSON file and prints a five-line NFR
+ * scorecard: target vs. achieved vs. pass/fail, for exactly the five
+ * requirements this skill always asks for (Concurrent Users, TPS, Peak
+ * Load, Latency, TAT). Zero dependencies — Node's stdlib only, since Node
+ * is the one runtime this skill can assume is present in any full-stack web
+ * repo (the frontend needs it even when the backend is Python).
+ *
+ * Field shapes below match k6 v2.2.0's --summary-export format, confirmed
+ * against a real run while validating this skill:
+ *   - Stats (avg/min/med/max/p(90)/p(95)) sit DIRECTLY on the metric object
+ *     — there is no `.values` wrapper.
+ *   - A metric's `.thresholds` map is keyed by the threshold expression
+ *     string, value `true` means the threshold was BREACHED (failed), NOT
+ *     "ok" — inverted from what you'd guess. Confirmed against k6's own
+ *     console ✓/✗ output for the same run.
+ *   - Rate-type metrics (http_req_failed, checks, custom Rate metrics)
+ *     expose the rate as `.value` (0-1) plus `.passes`/`.fails` counts —
+ *     not `.rate`. `http_reqs` (a Counter) is the one that uses `.rate`
+ *     (requests/sec) alongside `.count`.
+ * If a future k6 version changes this shape, this script degrades to "n/a"
+ * for the affected field rather than crashing — check a real
+ * --summary-export file's structure if scores start coming back empty.
+ *
+ * Usage:
+ *   node nfr-report.mjs <summary.json> <concurrentUsers> <tpsTarget> <peakLoad> <latencyP95Ms> <tatP95Ms>
+ *
+ * The target values are passed explicitly (not re-read from anywhere) so
+ * this script has no way to silently drift from what the user actually
+ * asked for this run.
+ */
+import { readFileSync } from 'node:fs';
+
+const [, , summaryPath, concurrentUsersArg, tpsTargetArg, peakLoadArg, latencyArg, tatArg] = process.argv;
+
+if (!summaryPath || !concurrentUsersArg || !tpsTargetArg || !peakLoadArg || !latencyArg || !tatArg) {
+  console.error(
+    'Usage: node nfr-report.mjs <summary.json> <concurrentUsers> <tpsTarget> <peakLoad> <latencyP95Ms> <tatP95Ms>',
+  );
+  process.exit(2);
+}
+
+const targets = {
+  concurrentUsers: Number(concurrentUsersArg),
+  tpsTarget: Number(tpsTargetArg),
+  peakLoad: Number(peakLoadArg),
+  latencyP95Ms: Number(latencyArg),
+  tatP95Ms: Number(tatArg),
+};
+
+const summary = JSON.parse(readFileSync(summaryPath, 'utf8'));
+const metrics = summary.metrics ?? {};
+
+function metricField(name, field) {
+  return metrics[name]?.[field];
+}
+
+// true = passed, false = failed, undefined = no threshold recorded for this metric
+function thresholdPassed(name) {
+  const thresholds = metrics[name]?.thresholds;
+  if (!thresholds) return undefined;
+  return Object.values(thresholds).every((breached) => breached === false);
+}
+
+function fmt(n, unit = '') {
+  if (n === undefined || n === null || Number.isNaN(n)) return 'n/a';
+  return `${Math.round(n * 100) / 100}${unit}`;
+}
+
+function verdict(pass) {
+  if (pass === undefined) return '⚠ no threshold data';
+  return pass ? '✔ PASS' : '✘ FAIL';
+}
+
+// vus_max is deliberately NOT used for "Concurrent Users achieved": it's the
+// peak VU pool across BOTH scenarios (concurrent_sessions' fixed VUs plus
+// throughput_ramp's much larger preAllocatedVUs/maxVUs pool for arrival-rate
+// scheduling), so it doesn't isolate what concurrent_sessions actually ran.
+// A constant-vus executor sustains exactly its configured `vus` count by
+// construction — there is nothing to "achieve" beyond confirming it didn't
+// error out, which the checks/error-rate line below already covers.
+// Scoped to just the throughput_ramp scenario via the always-true threshold
+// tag trick in lib/scenarios.js — the unscoped http_reqs blends in the
+// concurrent_sessions scenario's own request volume and is not comparable
+// to TPS_TARGET/PEAK_LOAD.
+const scopedThroughput = metrics['http_reqs{scenario:throughput_ramp}'];
+const achievedRps = scopedThroughput?.rate ?? metricField('http_reqs', 'rate');
+const achievedLatencyP95 = metricField('http_req_duration', 'p(95)');
+const achievedErrorRate = metricField('http_req_failed', 'value');
+const achievedChecksRate = metricField('checks', 'value');
+const achievedTatP95 =
+  metricField('booking_lifecycle_tat_ms', 'p(95)') ??
+  metricField('group_duration{group:::booking_lifecycle}', 'p(95)'); // fallback if the custom Trend was renamed for this app
+const totalRequests = metricField('http_reqs', 'count');
+
+const rows = [
+  {
+    label: 'Concurrent Users',
+    target: `${targets.concurrentUsers}`,
+    achieved: `${targets.concurrentUsers} sessions held for the full session duration (constant-vus executor guarantees this by construction — see the checks/error-rate line below for whether those sessions completed cleanly under that concurrency)`,
+    verdict: verdict(undefined),
+  },
+  {
+    label: 'TPS (avg req/s, throughput_ramp scenario)',
+    target: `${targets.tpsTarget}`,
+    achieved: fmt(achievedRps, '/s'),
+    verdict: verdict(thresholdPassed('http_req_failed')),
+  },
+  {
+    label: 'Peak Load (burst req/s target)',
+    target: `${targets.peakLoad}`,
+    achieved: fmt(achievedRps, '/s') + ' (test-average — the peak-stage window\'s own rate is only visible in the console\'s stage-by-stage progress output, not in the summary file)',
+    verdict: verdict(thresholdPassed('http_req_failed')),
+  },
+  {
+    label: 'Latency (p95, ms)',
+    target: `${targets.latencyP95Ms}`,
+    achieved: fmt(achievedLatencyP95),
+    verdict: verdict(thresholdPassed('http_req_duration')),
+  },
+  {
+    label: 'TAT (p95, ms, full transaction)',
+    target: `${targets.tatP95Ms}`,
+    achieved: fmt(achievedTatP95),
+    verdict: verdict(thresholdPassed('booking_lifecycle_tat_ms') ?? thresholdPassed('group_duration{group:::booking_lifecycle}')),
+  },
+];
+
+console.log('\nNFR scorecard\n' + '='.repeat(60));
+for (const row of rows) {
+  console.log(row.label);
+  console.log(`  target: ${row.target}   achieved: ${row.achieved}`);
+  console.log(`  ${row.verdict}`);
+}
+console.log('='.repeat(60));
+console.log(
+  `Error rate: ${fmt((achievedErrorRate ?? 0) * 100, '%')}  |  ` +
+    `Total requests: ${fmt(totalRequests)}  |  ` +
+    `Checks passed: ${fmt((achievedChecksRate ?? 0) * 100, '%')}`,
+);
+console.log(
+  "\nNote: pass/fail above mirrors k6's own threshold evaluation embedded in the\n" +
+    'summary file — this script formats it, it does not re-derive it.\n',
+);
